@@ -1,139 +1,227 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # coding=utf-8
-
-"""MQTT Home Assistant auto discovery for rtl_433 events."""
-
-# It is strongly recommended to run rtl_433 with "-C si" and "-M newmodel".
-
-# Needs Paho-MQTT https://pypi.python.org/pypi/paho-mqtt
-
-# Option: PEP 3143 - Standard daemon process library
-# (use Python 3.x or pip install python-daemon)
-# import daemon
 
 from __future__ import print_function
 from __future__ import with_statement
 
+AP_DESCRIPTION="""
+Publish Home Assistant MQTT auto discovery topics for rtl_433 devices.
+
+rtl_433_mqtt_hass.py connects to MQTT and subscribes to the rtl_433
+event stream that is published to MQTT by rtl_433. The script publishes
+additional MQTT topics that can be used by Home Assistant to automatically
+discover and minimally configure new devices.
+
+The configuration topics published by this script tell Home Assistant
+what MQTT topics to subscribe to in order to receive the data published
+as device topics by MQTT.
+"""
+
+AP_EPILOG="""
+It is strongly recommended to run rtl_433 with "-C si" and "-M newmodel".
+This script requires rtl_433 to publish both event messages and device
+messages.
+
+MQTT Username and Password can be set via the cmdline or passed in the
+environment: MQTT_USERNAME and MQTT_PASSWORD.
+
+Prerequisites:
+
+1. rtl_433 running separately publishing events and devices messages to MQTT.
+
+2. Python installation
+* Python 3.x preferred.
+* Needs Paho-MQTT https://pypi.python.org/pypi/paho-mqtt
+
+  Debian/raspbian:  apt install python3-paho-mqtt
+  Or
+  pip install paho-mqtt
+* Optional for running as a daemon see PEP 3143 - Standard daemon process library
+  (use Python 3.x or pip install python-daemon)
+
+
+Running:
+
+This script can run continually as a daemon, where it will publish
+a configuration topic for the device events sent to MQTT by rtl_433
+every 10 minutes.
+
+Alternatively if the rtl_433 devices in your environment change infrequently
+this script can use the MQTT retain flag to make the configuration topics
+persistent. The script will only need to be run when things change or if
+the MQTT server loses its retained messages.
+
+Getting rtl_433 devices back after Home Assistant restarts will happen
+more quickly if MQTT retain is enabled. Note however that definitions
+for any transitient devices/false positives will retained indefinitely.
+
+If your sensor values change infrequently and you prefer to write the most
+recent value even if not changed set -f to append "force_update = true" to
+all configs. This is useful if you're graphing the sensor data or want to
+alert on missing data.
+
+Suggestions:
+
+Running this script will cause a number of Home Assistant entities (sensors
+and binary sensors) to be created. These entities can linger for a while unless
+the topic is republished with an empty config string.  To avoid having to
+do a lot of clean up When running this initially or debugging, set this
+script to publish to a topic other than the one Home Assistant users (homeassistant).
+
+MQTT Explorer (http://http://mqtt-explorer.com/) is a very nice GUI for
+working with MQTT. It is free, cross platform, and OSS. The structured
+hierarchical view makes it easier to understand what rtl_433 is publishing
+and how this script works with Home Assistant.
+
+MQTT Explorer also makes it easy to publish an empty config topic to delete an
+entity from Home Assistant.
+
+
+Known Issues:
+
+Currently there is no white or black lists, so any device that rtl_433 receives
+including transients, false positives, will create a bunch of entities in
+Home Assistant.
+
+As of 2020-10, Home Assistant MQTT auto discovery doesn't currently support
+supplying "friendly name", and "area" key, so some configuration must be
+done in Home Assistant.
+
+There is a single global set of field mappings to Home Assistant meta data.
+
+"""
+
+
+
+# import daemon
+
+
 import os
-import socket
+import argparse
+import logging
 import time
 import json
 import paho.mqtt.client as mqtt
 
-MQTT_HOST = os.environ['MQTT_HOST']
-MQTT_PORT = os.environ['MQTT_PORT']
-MQTT_USERNAME = os.environ['MQTT_USERNAME']
-MQTT_PASSWORD = os.environ['MQTT_PASSWORD']
-MQTT_TOPIC = os.environ['MQTT_TOPIC']
-DISCOVERY_PREFIX = os.environ['DISCOVERY_PREFIX']
-DISCOVERY_INTERVAL = os.environ['DISCOVERY_INTERVAL']
-
-# Convert number environment variables to int
-MQTT_PORT = int(MQTT_PORT)
-DISCOVERY_INTERVAL = int(DISCOVERY_INTERVAL)
 
 discovery_timeouts = {}
 
+# Fields used for creating topic names
+NAMING_KEYS = [ "type", "model", "subtype", "channel", "id" ]
+
+# Fields that get ignored when publishing to Home Assistant
+# (reduces noise to help spot missing field mappings)
+SKIP_KEYS = NAMING_KEYS + [ "time", "mic", "mod", "freq", "sequence_num",
+                            "message_type", "exception", "raw_msg" ]
+
+
+# Global mapping of rtl_433 field names to Home Assistant metadata.
+# @todo - should probably externalize to a config file
+# @todo - Model specific definitions might be needed
+
 mappings = {
-    "protocol": {
-        "device_type": "sensor",
-        "object_suffix": "Protocol",
-        "config": {
-            "name": "Protocol",
-#            "value_template": "{{ value_json.protocol }}"
-        }
-    },
-    "rssi": {
-        "device_type": "sensor",
-        "object_suffix": "RSSI",
-        "config": {
-            "name": "RSSI",
-            "unit_of_measurement": "dB",
-#            "value_template": "{{ value_json.rssi }}"
-        }
-    },
     "temperature_C": {
         "device_type": "sensor",
-        "object_suffix": "Temperature",
+        "object_suffix": "T",
         "config": {
             "device_class": "temperature",
             "name": "Temperature",
             "unit_of_measurement": "°C",
-#            "value_template": "{{ value_json.temperature_C }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
     "temperature_1_C": {
         "device_type": "sensor",
-        "object_suffix": "Temperature 1",
+        "object_suffix": "T1",
         "config": {
             "device_class": "temperature",
             "name": "Temperature 1",
             "unit_of_measurement": "°C",
-            "value_template": "{{ value_json.temperature_1_C }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
     "temperature_2_C": {
         "device_type": "sensor",
-        "object_suffix": "Temperature 2",
+        "object_suffix": "T2",
         "config": {
             "device_class": "temperature",
             "name": "Temperature 2",
             "unit_of_measurement": "°C",
-            "value_template": "{{ value_json.temperature_2_C }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
     "temperature_F": {
         "device_type": "sensor",
-        "object_suffix": "Temperature",
+        "object_suffix": "F",
         "config": {
             "device_class": "temperature",
             "name": "Temperature",
             "unit_of_measurement": "°F",
-            "value_template": "{{ value_json.temperature_F }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
 
     "battery_ok": {
         "device_type": "sensor",
-        "object_suffix": "Battery",
+        "object_suffix": "B",
         "config": {
             "device_class": "battery",
             "name": "Battery",
             "unit_of_measurement": "%",
-            "value_template": "{{ float(value_json.battery_ok) * 99 + 1 }}"
+            "value_template": "{{ float(value) * 99 + 1 }}",
+            "state_class": "measurement"
         }
     },
 
     "humidity": {
         "device_type": "sensor",
-        "object_suffix": "Humidity",
+        "object_suffix": "H",
         "config": {
             "device_class": "humidity",
             "name": "Humidity",
             "unit_of_measurement": "%",
-#            "value_template": "{{ value_json.humidity }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
 
     "moisture": {
         "device_type": "sensor",
-        "object_suffix": "Moisture",
+        "object_suffix": "H",
         "config": {
-            "device_class": "moisture",
+            "device_class": "humidity",
             "name": "Moisture",
             "unit_of_measurement": "%",
-            "value_template": "{{ value_json.moisture }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
 
     "pressure_hPa": {
         "device_type": "sensor",
-        "object_suffix": "Pressure",
+        "object_suffix": "P",
         "config": {
             "device_class": "pressure",
             "name": "Pressure",
             "unit_of_measurement": "hPa",
-            "value_template": "{{ value_json.pressure_hPa }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "pressure_kPa": {
+        "device_type": "sensor",
+        "object_suffix": "P",
+        "config": {
+            "device_class": "pressure",
+            "name": "Pressure",
+            "unit_of_measurement": "kPa",
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
 
@@ -141,10 +229,45 @@ mappings = {
         "device_type": "sensor",
         "object_suffix": "WS",
         "config": {
+            "name": "Wind Speed",
+            "unit_of_measurement": "km/h",
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "wind_avg_km_h": {
+        "device_type": "sensor",
+        "object_suffix": "WS",
+        "config": {
             "device_class": "weather",
             "name": "Wind Speed",
             "unit_of_measurement": "km/h",
-            "value_template": "{{ value_json.wind_speed_km_h }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "wind_avg_mi_h": {
+        "device_type": "sensor",
+        "object_suffix": "WS",
+        "config": {
+            "device_class": "weather",
+            "name": "Wind Speed",
+            "unit_of_measurement": "mi/h",
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "wind_avg_m_s": {
+        "device_type": "sensor",
+        "object_suffix": "WS",
+        "config": {
+            "name": "Wind Average",
+            "unit_of_measurement": "km/h",
+            "value_template": "{{ (float(value|float) * 3.6) | round(2) }}",
+            "state_class": "measurement"
         }
     },
 
@@ -152,10 +275,10 @@ mappings = {
         "device_type": "sensor",
         "object_suffix": "WS",
         "config": {
-            "device_class": "weather",
             "name": "Wind Speed",
             "unit_of_measurement": "km/h",
-            "value_template": "{{ float(value_json.wind_speed_m_s) * 3.6 }}"
+            "value_template": "{{ float(value|float) * 3.6 }}",
+            "state_class": "measurement"
         }
     },
 
@@ -163,10 +286,32 @@ mappings = {
         "device_type": "sensor",
         "object_suffix": "GS",
         "config": {
-            "device_class": "weather",
             "name": "Gust Speed",
             "unit_of_measurement": "km/h",
-            "value_template": "{{ value_json.gust_speed_km_h }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+  
+    "wind_max_km_h": {
+        "device_type": "sensor",
+        "object_suffix": "GS",
+        "config": {
+            "name": "Wind max speed",
+            "unit_of_measurement": "km/h",
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "wind_max_m_s": {
+        "device_type": "sensor",
+        "object_suffix": "GS",
+        "config": {
+            "name": "Wind max",
+            "unit_of_measurement": "km/h",
+            "value_template": "{{ (float(value|float) * 3.6) | round(2) }}",
+            "state_class": "measurement"
         }
     },
 
@@ -174,10 +319,10 @@ mappings = {
         "device_type": "sensor",
         "object_suffix": "GS",
         "config": {
-            "device_class": "weather",
             "name": "Gust Speed",
             "unit_of_measurement": "km/h",
-            "value_template": "{{ float(value_json.gust_speed_m_s) * 3.6 }}"
+            "value_template": "{{ float(value|float) * 3.6 }}",
+            "state_class": "measurement"
         }
     },
 
@@ -185,10 +330,10 @@ mappings = {
         "device_type": "sensor",
         "object_suffix": "WD",
         "config": {
-            "device_class": "weather",
             "name": "Wind Direction",
             "unit_of_measurement": "°",
-            "value_template": "{{ value_json.wind_dir_deg }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
 
@@ -196,10 +341,10 @@ mappings = {
         "device_type": "sensor",
         "object_suffix": "RT",
         "config": {
-            "device_class": "weather",
             "name": "Rain Total",
             "unit_of_measurement": "mm",
-            "value_template": "{{ value_json.rain_mm }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "total_increasing"
         }
     },
 
@@ -207,25 +352,166 @@ mappings = {
         "device_type": "sensor",
         "object_suffix": "RR",
         "config": {
-            "device_class": "weather",
             "name": "Rain Rate",
             "unit_of_measurement": "mm/h",
-            "value_template": "{{ value_json.rain_mm_h }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
         }
     },
 
-    # motion...
+    "rain_in": {
+        "device_type": "sensor",
+        "object_suffix": "RT",
+        "config": {
+            "name": "Rain Total",
+            "unit_of_measurement": "mm",
+            "value_template": "{{ (float(value|float) * 25.4) | round(2) }}",
+            "state_class": "total_increasing"
+        }
+    },
 
-    # switches...
+    "rain_rate_in_h": {
+        "device_type": "sensor",
+        "object_suffix": "RR",
+        "config": {
+            "name": "Rain Rate",
+            "unit_of_measurement": "mm/h",
+            "value_template": "{{ (float(value|float) * 25.4) | round(2) }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "tamper": {
+        "device_type": "binary_sensor",
+        "object_suffix": "tamper",
+        "config": {
+            "device_class": "safety",
+            "force_update": "true",
+            "payload_on": "1",
+            "payload_off": "0"
+        }
+    },
+
+    "alarm": {
+        "device_type": "binary_sensor",
+        "object_suffix": "alarm",
+        "config": {
+            "device_class": "safety",
+            "force_update": "true",
+            "payload_on": "1",
+            "payload_off": "0"
+        }
+    },
+
+    "rssi": {
+        "device_type": "sensor",
+        "object_suffix": "rssi",
+        "config": {
+            "device_class": "signal_strength",
+            "unit_of_measurement": "dB",
+            "value_template": "{{ value|float|round(2) }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "snr": {
+        "device_type": "sensor",
+        "object_suffix": "snr",
+        "config": {
+            "device_class": "signal_strength",
+            "unit_of_measurement": "dB",
+            "value_template": "{{ value|float|round(2) }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "noise": {
+        "device_type": "sensor",
+        "object_suffix": "noise",
+        "config": {
+            "device_class": "signal_strength",
+            "unit_of_measurement": "dB",
+            "value_template": "{{ value|float|round(2) }}",
+            "state_class": "measurement"
+        }
+    },
 
     "depth_cm": {
         "device_type": "sensor",
         "object_suffix": "D",
         "config": {
-            "device_class": "depth",
             "name": "Depth",
             "unit_of_measurement": "cm",
-            "value_template": "{{ value_json.depth_cm }}"
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "power_W": {
+        "device_type": "sensor",
+        "object_suffix": "watts",
+        "config": {
+            "device_class": "power",
+            "name": "Power",
+            "unit_of_measurement": "W",
+            "value_template": "{{ value|float }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "lux": {
+        "device_type": "sensor",
+        "object_suffix": "lux",
+        "config": {
+            "device_class": "weather",
+            "name": "Outside Luminancee",
+            "unit_of_measurement": "lux",
+            "value_template": "{{ value|int }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "uv": {
+        "device_type": "sensor",
+        "object_suffix": "uv",
+        "config": {
+            "device_class": "weather",
+            "name": "UV Index",
+            "unit_of_measurement": "UV Index",
+            "value_template": "{{ value|int }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "storm_dist": {
+        "device_type": "sensor",
+        "object_suffix": "stdist",
+        "config": {
+            "name": "Lightning Distance",
+            "unit_of_measurement": "mi",
+            "value_template": "{{ value|int }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "strike_distance": {
+        "device_type": "sensor",
+        "object_suffix": "stdist",
+        "config": {
+            "name": "Lightning Distance",
+            "unit_of_measurement": "mi",
+            "value_template": "{{ value|int }}",
+            "state_class": "measurement"
+        }
+    },
+
+    "strike_count": {
+        "device_type": "sensor",
+        "object_suffix": "strcnt",
+        "config": {
+            "name": "Lightning Strike Count",
+            "value_template": "{{ value|int }}",
+            "state_class": "total_increasing"
         }
     },
 }
@@ -233,29 +519,34 @@ mappings = {
 
 def mqtt_connect(client, userdata, flags, rc):
     """Callback for MQTT connects."""
-    print("MQTT connected: " + mqtt.connack_string(rc))
-    client.publish("/".join([MQTT_TOPIC, "status"]), payload="online", qos=0, retain=True)
+
+    logging.info("MQTT connected: " + mqtt.connack_string(rc))
     if rc != 0:
-        print("Could not connect. Error: " + str(rc))
+        logging.error("Could not connect. Error: " + str(rc))
     else:
-        client.subscribe("/".join([MQTT_TOPIC, "events"]))
+        logging.info("Subscribing to: " + args.rtl_topic)
+        client.subscribe(args.rtl_topic)
 
 
 def mqtt_disconnect(client, userdata, rc):
     """Callback for MQTT disconnects."""
-    print("MQTT disconnected: " + mqtt.connack_string(rc))
+    logging.info("MQTT disconnected: " + mqtt.connack_string(rc))
 
 
 def mqtt_message(client, userdata, msg):
     """Callback for MQTT message PUBLISH."""
+    logging.debug("MQTT message: " + json.dumps(msg.payload.decode()))
+
     try:
         # Decode JSON payload
         data = json.loads(msg.payload.decode())
-        bridge_event_to_hass(client, msg.topic, data)
 
     except json.decoder.JSONDecodeError:
-        print("JSON decode error: " + msg.payload.decode())
+        logging.error("JSON decode error: " + msg.payload.decode())
         return
+
+    topicprefix = "/".join(msg.topic.split("/", 2)[:2])
+    bridge_event_to_hass(client, topicprefix, data)
 
 
 def sanitize(text):
@@ -266,78 +557,107 @@ def sanitize(text):
             .replace(".", "_")
             .replace("&", ""))
 
+def rtl_433_device_topic(data):
+    """Return rtl_433 device topic to subscribe to for a data element"""
 
-def publish_config(mqttc, topic, manmodel, instance, channel, mapping):
+    path_elements = []
+
+    for key in NAMING_KEYS:
+        if key in data:
+            element = sanitize(str(data[key]))
+            path_elements.append(element)
+
+    return '/'.join(path_elements)
+
+
+def publish_config(mqttc, topic, model, instance, mapping):
     """Publish Home Assistant auto discovery data."""
     global discovery_timeouts
 
+    instance_no_slash = instance.replace("/", "-")
     device_type = mapping["device_type"]
-    object_id = "_".join([manmodel.replace("-", "_"), instance])
     object_suffix = mapping["object_suffix"]
+    object_id = instance_no_slash
+    object_name = "-".join([object_id,object_suffix])
 
-    path = "/".join([DISCOVERY_PREFIX, device_type, object_id, object_suffix, "config"])
+    path = "/".join([args.discovery_prefix, device_type, object_id, object_name, "config"])
 
     # check timeout
     now = time.time()
     if path in discovery_timeouts:
         if discovery_timeouts[path] > now:
-            return
+            logging.debug("Discovery timeout in the future for: " + path)
+            return False
 
-    discovery_timeouts[path] = now + DISCOVERY_INTERVAL
+    discovery_timeouts[path] = now + args.discovery_interval
 
     config = mapping["config"].copy()
-    config["state_topic"] = "/".join([MQTT_TOPIC, manmodel, instance, channel, topic])
-    config["name"] = " ".join([manmodel.replace("-", " "), instance, object_suffix])
-    config["unique_id"] = "".join(["rtl433", device_type, instance, object_suffix])
-    config["availability_topic"] = "/".join([MQTT_TOPIC, "status"])
+    config["name"] = object_name
+    config["state_topic"] = topic
+    config["unique_id"] = object_name
+    config["device"] = { "identifiers": object_id, "name": object_id, "model": model, "manufacturer": "rtl_433" }
 
-    # add Home Assistant device info
+    if args.force_update:
+        config["force_update"] = "true"
 
-    manufacturer,model = manmodel.split("-", 1)
+    logging.debug(path + ":" + json.dumps(config))
 
-    device = {}
-    device["identifiers"] = instance
-    device["name"] = instance
-    device["model"] = model
-    device["manufacturer"] = manufacturer
-    config["device"] = device
-    
-    mqttc.publish(path, json.dumps(config))
-    print(path, " : ", json.dumps(config))
+    mqttc.publish(path, json.dumps(config), retain=args.retain)
 
+    return True
 
-def bridge_event_to_hass(mqttc, topic, data):
+def bridge_event_to_hass(mqttc, topicprefix, data):
     """Translate some rtl_433 sensor data to Home Assistant auto discovery."""
 
     if "model" not in data:
         # not a device event
+        logging.debug("Model is not defined. Not sending event to Home Assistant.")
         return
-    manmodel = sanitize(data["model"])
 
-    if "id" in data:
-        instance = str(data["id"])
+    model = sanitize(data["model"])
+
+    skipped_keys = []
+    published_keys = []
+
+    instance = rtl_433_device_topic(data)
     if not instance:
         # no unique device identifier
+        logging.warning("No suitable identifier found for model: ", model)
         return
-
-    if "channel" in data:
-        channel = str(data["channel"])
 
     # detect known attributes
     for key in data.keys():
         if key in mappings:
-            publish_config(mqttc, key, manmodel, instance, channel, mappings[key])
+            # topic = "/".join([topicprefix,"devices",model,instance,key])
+            topic = "/".join([topicprefix,"devices",instance,key])
+            if publish_config(mqttc, topic, model, instance, mappings[key]):
+                published_keys.append(key)
+        else:
+            if key not in SKIP_KEYS:
+                skipped_keys.append(key)
+
+    if published_keys:
+        logging.info("Published %s: %s" % (instance, ", ".join(published_keys)))
+
+        if skipped_keys:
+            logging.info("Skipped %s: %s" % (instance, ", ".join(skipped_keys)))
 
 
 def rtl_433_bridge():
     """Run a MQTT Home Assistant auto discovery bridge for rtl_433."""
+
     mqttc = mqtt.Client()
-    mqttc.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+    if args.debug:
+        mqttc.enable_logger()
+
+    if args.user is not None:
+        mqttc.username_pw_set(args.user, args.password)
     mqttc.on_connect = mqtt_connect
     mqttc.on_disconnect = mqtt_disconnect
     mqttc.on_message = mqtt_message
-    mqttc.will_set("/".join([MQTT_TOPIC, "status"]), payload="offline", qos=0, retain=True)
-    mqttc.connect_async(MQTT_HOST, MQTT_PORT, 60)
+    mqttc.connect_async(args.host, args.port, 60)
+    logging.debug("MQTT Client: Starting Loop")
     mqttc.loop_start()
 
     while True:
@@ -355,4 +675,55 @@ def run():
 
 
 if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.INFO)
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     description=AP_DESCRIPTION,
+                                     epilog=AP_EPILOG)
+
+    parser.add_argument("-d", "--debug", action="store_true")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument("-u", "--user", type=str, help="MQTT username")
+    parser.add_argument("-P", "--password", type=str, help="MQTT password")
+    parser.add_argument("-H", "--host", type=str, default="127.0.0.1",
+                        help="MQTT hostname to connect to (default: %(default)s)")
+    parser.add_argument("-p", "--port", type=int, default=1883,
+                        help="MQTT port (default: %(default)s)")
+    parser.add_argument("-r", "--retain", action="store_true")
+    parser.add_argument("-f", "--force_update", action="store_true",
+                        help="Append 'force_update = true' to all configs.")
+    parser.add_argument("-R", "--rtl-topic", type=str,
+                        default="rtl_433/+/events",
+                        dest="rtl_topic",
+                        help="rtl_433 MQTT event topic to subscribe to (default: %(default)s)")
+    parser.add_argument("-D", "--discovery-prefix", type=str,
+                        dest="discovery_prefix",
+                        default="homeassistant",
+                        help="Home Assistant MQTT topic prefix (default: %(default)s)")
+    parser.add_argument("-i", "--interval", type=int,
+                        dest="discovery_interval",
+                        default=600,
+                        help="Interval to republish config topics in seconds (default: %(default)d)")
+    args = parser.parse_args()
+
+    if args.debug and args.quiet:
+        logging.critical("Debug and quiet can not be specified at the same time")
+        exit(1)
+
+    if args.debug:
+        logging.info("Enabling debug logging")
+        logging.getLogger().setLevel(logging.DEBUG)
+    if args.quiet:
+        logging.getLogger().setLevel(logging.ERROR)
+
+    # allow setting MQTT username and password via environment variables
+    if not args.user and 'MQTT_USERNAME' in os.environ:
+        args.user = os.environ['MQTT_USERNAME']
+
+    if not args.password and 'MQTT_PASSWORD' in os.environ:
+        args.password = os.environ['MQTT_PASSWORD']
+
+    if not args.user or not args.password:
+        logging.warning("User or password is not set. Check credentials if subscriptions do not return messages.")
+
     run()
